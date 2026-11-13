@@ -12,8 +12,10 @@ import pandas as pd
 
 from modeldiff import (
     CheckDecisionPolicy,
+    CheckMonitor,
     CheckSuite,
     ModelDiffConfig,
+    SequentialCheckPolicy,
     StabilityConfig,
     compare_predictions,
     compare_stable_predictions,
@@ -133,6 +135,32 @@ def build_parser() -> argparse.ArgumentParser:
     check_parser.add_argument("--correction", choices=["bonferroni", "none"], default="bonferroni")
     check_parser.add_argument("--bootstrap", type=_positive_int, default=2000)
     check_parser.add_argument("--random-state", type=int, default=42)
+
+    monitor_parser = subparsers.add_parser(
+        "monitor",
+        help="update resumable, anytime-valid saved checks with one labeled batch",
+        description=(
+            "Update a monitor state with one labeled batch. Exit 0: every check passes; "
+            "exit 1: fail, continue, insufficient data, or empty suite; exit 2: invalid state, "
+            "bounds, inputs, or usage."
+        ),
+    )
+    monitor_parser.add_argument("--state", required=True, type=Path)
+    monitor_parser.add_argument(
+        "--checks", type=Path, help="saved suite; required only when creating monitor state"
+    )
+    monitor_parser.add_argument("--data", required=True, type=Path)
+    monitor_parser.add_argument("--target", required=True)
+    monitor_parser.add_argument("--baseline-pred", required=True)
+    monitor_parser.add_argument("--candidate-pred", required=True)
+    monitor_parser.add_argument("--exclude", action="append", default=[])
+    monitor_parser.add_argument("--confidence-level", type=float)
+    monitor_parser.add_argument("--correction", choices=["bonferroni", "none"])
+    monitor_parser.add_argument("--loss-delta-lower", type=float)
+    monitor_parser.add_argument("--loss-delta-upper", type=float)
+    monitor_parser.add_argument("--html", type=Path)
+    monitor_parser.add_argument("--json", type=Path)
+    monitor_parser.add_argument("--junit", type=Path)
     return parser
 
 
@@ -314,6 +342,65 @@ def _run_stability(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
     return 1 if failed else 0
 
 
+def _run_monitor(args: argparse.Namespace) -> int:
+    supplied_policy = any(
+        value is not None
+        for value in (
+            args.confidence_level,
+            args.correction,
+            args.loss_delta_lower,
+            args.loss_delta_upper,
+        )
+    )
+    if (args.loss_delta_lower is None) != (args.loss_delta_upper is None):
+        raise ValueError("--loss-delta-lower and --loss-delta-upper must be provided together")
+    if args.state.exists():
+        monitor = CheckMonitor.load(args.state)
+        if supplied_policy:
+            raise ValueError("monitor policy options can only be set when creating state")
+        if args.checks is not None and CheckSuite.load(args.checks) != monitor.suite:
+            raise ValueError("--checks does not match the suite stored in monitor state")
+    else:
+        if args.checks is None:
+            raise ValueError("--checks is required when creating monitor state")
+        bounds = (
+            (args.loss_delta_lower, args.loss_delta_upper)
+            if args.loss_delta_lower is not None and args.loss_delta_upper is not None
+            else None
+        )
+        monitor = CheckMonitor(
+            CheckSuite.load(args.checks),
+            SequentialCheckPolicy(
+                confidence_level=(
+                    0.95 if args.confidence_level is None else args.confidence_level
+                ),
+                correction="bonferroni" if args.correction is None else args.correction,
+                loss_delta_bounds=bounds,
+            ),
+        )
+    data = pd.read_csv(args.data)
+    required = {args.target, args.baseline_pred, args.candidate_pred}
+    missing = required - set(data.columns)
+    if missing:
+        raise ValueError(f"missing columns: {', '.join(sorted(missing))}")
+    features = data.drop(columns=list(required | set(args.exclude)), errors="ignore")
+    result = monitor.update(
+        data[args.baseline_pred],
+        data[args.candidate_pred],
+        features,
+        data[args.target],
+    )
+    monitor.to_json(args.state)
+    print(result.summary())
+    if args.json:
+        result.to_json(args.json)
+    if args.html:
+        result.to_html(args.html)
+    if args.junit:
+        result.to_junit_xml(args.junit)
+    return 0 if result.overall_status == "pass" else 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the ModelDiff-ML CLI and return a CI-friendly exit status."""
     parser = build_parser()
@@ -323,9 +410,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "stability":
         return _run_stability(args, parser)
     try:
-        return _run_check(args)
+        return _run_monitor(args) if args.command == "monitor" else _run_check(args)
     except (ValueError, TypeError, OSError, UnicodeError, pd.errors.ParserError) as error:
-        print(f"modeldiff-ml check: error: {error}", file=sys.stderr)
+        print(f"modeldiff-ml {args.command}: error: {error}", file=sys.stderr)
         return 2
 
 

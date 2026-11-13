@@ -256,3 +256,107 @@ def test_stability_cli_runs_stable_comparison(tmp_path: Path, monkeypatch: objec
     )
 
     assert exit_code == 0
+
+
+def _write_monitor_data(path: Path, candidate: float, n: int = 5000) -> None:
+    pd.DataFrame(
+        {
+            "x": np.arange(n),
+            "y": np.zeros(n),
+            "old": np.zeros(n),
+            "new": np.full(n, candidate),
+        }
+    ).to_csv(path, index=False)
+
+
+def test_monitor_cli_creates_resumes_and_reports_state(tmp_path: Path) -> None:
+    checks = tmp_path / "checks.json"
+    state = tmp_path / "monitor.json"
+    data = tmp_path / "batch.csv"
+    result_json = tmp_path / "result.json"
+    junit = tmp_path / "result.xml"
+    _suite(minimum=1).to_json(checks)
+    _write_monitor_data(data, 0.0)
+    common = [
+        "--state",
+        str(state),
+        "--data",
+        str(data),
+        "--target",
+        "y",
+        "--baseline-pred",
+        "old",
+        "--candidate-pred",
+        "new",
+    ]
+
+    first = main(
+        [
+            "monitor",
+            "--checks",
+            str(checks),
+            *common,
+            "--loss-delta-lower",
+            "-1",
+            "--loss-delta-upper",
+            "1",
+        ]
+    )
+    second = main(
+        [
+            "monitor",
+            *common,
+            "--json",
+            str(result_json),
+            "--junit",
+            str(junit),
+        ]
+    )
+
+    assert first == second == 0
+    assert json.loads(state.read_text())["sample_count"] == 10_000
+    assert json.loads(result_json.read_text())["overall_status"] == "pass"
+    assert "anytime-valid checks" in junit.read_text()
+
+
+def test_monitor_cli_rejects_missing_initial_suite_and_policy_changes(
+    tmp_path: Path, capsys: object
+) -> None:
+    state = tmp_path / "monitor.json"
+    data = tmp_path / "batch.csv"
+    _write_monitor_data(data, 0.05, n=10)
+    common = [
+        "monitor",
+        "--state",
+        str(state),
+        "--data",
+        str(data),
+        "--target",
+        "y",
+        "--baseline-pred",
+        "old",
+        "--candidate-pred",
+        "new",
+    ]
+
+    assert main(common) == 2
+    assert "--checks is required" in capsys.readouterr().err  # type: ignore[attr-defined]
+
+    checks = tmp_path / "checks.json"
+    _suite(minimum=1).to_json(checks)
+    assert (
+        main(
+            [
+                *common,
+                "--checks",
+                str(checks),
+                "--loss-delta-lower",
+                "-1",
+                "--loss-delta-upper",
+                "1",
+            ]
+        )
+        == 1
+    )
+    assert main([*common, "--confidence-level", "0.9"]) == 2
+    assert "only be set when creating" in capsys.readouterr().err  # type: ignore[attr-defined]

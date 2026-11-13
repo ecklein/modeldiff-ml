@@ -281,6 +281,69 @@ result = modeldiff.evaluate_checks(
 result.to_junit_xml("modeldiff-checks.xml")
 ```
 
+## Evaluate checks repeatedly without statistical peeking
+
+Fixed-sample confidence intervals are not designed to be recomputed after every new batch and
+stopped whenever the result first looks favorable. ModelDiff-ML can instead maintain time-uniform
+confidence sequences for saved checks. These intervals remain valid whenever they are inspected,
+provided observations are independent and stationary and every observed loss delta stays inside
+the configured bounds.
+
+```python
+from modeldiff import CheckMonitor, SequentialCheckPolicy
+
+monitor = CheckMonitor(
+    checks,
+    SequentialCheckPolicy(
+        confidence_level=0.95,
+        correction="bonferroni",
+        loss_delta_bounds=(-2.0, 2.0),
+    ),
+)
+
+result = monitor.update(
+    baseline_predictions=production_predictions_batch_1,
+    candidate_predictions=new_predictions_batch_1,
+    X=X_batch_1,
+    y=y_batch_1,
+)
+monitor.to_json("monitor-state.json")
+
+# Resume later without resetting the statistical history.
+monitor = CheckMonitor.load("monitor-state.json")
+result = monitor.update(
+    production_predictions_batch_2,
+    new_predictions_batch_2,
+    X_batch_2,
+    y_batch_2,
+)
+```
+
+Each check receives one of four statuses:
+
+| Status | Meaning |
+| --- | --- |
+| `pass` | The time-uniform upper bound is within tolerance |
+| `fail` | The time-uniform lower bound exceeds tolerance |
+| `continue` | The confidence sequence still crosses the tolerance |
+| `insufficient_data` | The region has not reached its configured minimum support |
+
+Accuracy and Brier loss deltas have automatic bounds of `[-1, 1]`. Log-loss bounds are derived from
+the suite's numerical epsilon. Regression losses are not intrinsically bounded, so their monitors
+require explicit finite `loss_delta_bounds`. A batch is rejected atomically if a matching
+observation falls outside those bounds; no partial state is retained.
+
+The implementation uses a two-sided Hoeffding confidence sequence with a summable alpha-spending
+schedule and optional Bonferroni correction across the complete suite. It is intentionally
+conservative and requires no parametric distribution assumption. The monitor state contains the
+suite, policy, sufficient statistics, and a suite fingerprint. Updates are chunk-invariant and the
+state file is replaced atomically after a successful CLI update.
+
+Time-uniform validity does not make arbitrary production data safe to reuse. Do not submit duplicate
+observations, change a saved region after monitoring starts, or use the guarantee across an
+unmodeled distribution change. The method follows the confidence-sequence framework described by
+[Howard et al.](https://doi.org/10.1214/20-AOS1991).
+
 The complete workflow is available in
 [`examples/saved_checks_example.py`](https://github.com/ecklein/modeldiff-ml/blob/main/examples/saved_checks_example.py).
 
@@ -364,6 +427,37 @@ modeldiff-ml check \
   --html check-results.html
 ```
 
+To create a monitor from a saved suite and add its first labeled batch:
+
+```bash
+modeldiff-ml monitor \
+  --checks model-checks.json \
+  --state monitor-state.json \
+  --data labeled-batch-1.csv \
+  --target y \
+  --baseline-pred production_prediction \
+  --candidate-pred new_prediction \
+  --loss-delta-lower -2 \
+  --loss-delta-upper 2 \
+  --json monitor-result.json \
+  --junit monitor-result.xml
+```
+
+Later updates only need the state and new batch:
+
+```bash
+modeldiff-ml monitor \
+  --state monitor-state.json \
+  --data labeled-batch-2.csv \
+  --target y \
+  --baseline-pred production_prediction \
+  --candidate-pred new_prediction
+```
+
+Monitor exit code `0` means every nonempty check passed. Exit code `1` covers `fail`, `continue`,
+`insufficient_data`, or an empty suite. Exit code `2` indicates invalid state, bounds, inputs, or
+usage. Policy and bounds are fixed when state is created and cannot be changed when it is resumed.
+
 The `check` command reads the task, metric, classification threshold, and epsilon from the suite.
 Exit code `0` means every check in a nonempty suite passed. Exit code `1` covers a failed or
 inconclusive check, insufficient data, or an empty suite. Exit code `2` indicates invalid usage,
@@ -395,10 +489,10 @@ threshold, numerical epsilon, and random seed. Defaults favor readable regions a
 slices. Missing feature values are never imputed; a missing value does not match a condition.
 
 Standard comparison reports retain schema `1.0`. Stability reports, newly saved check suites, and
-check evaluation results use schema `1.1`. Version `1.0` check suites remain loadable and use the
-observed decision policy. Serialized artifacts contain no model objects, raw observations, or
-original sample IDs. Unavailable numeric results are represented as `null`, never `NaN` or
-infinity.
+check evaluation results use schema `1.1`. Anytime-valid monitor state and result snapshots each use
+their own schema `1.0`. Version `1.0` check suites remain loadable and use the observed decision
+policy. Serialized artifacts contain no model objects, raw observations, or original sample IDs.
+Unavailable numeric results are represented as `null`, never `NaN` or infinity.
 
 ## Examples
 
@@ -409,6 +503,9 @@ plants a local classification regression inside a candidate that improves overal
 does the same for continuous predictions. The
 [`saved checks example`](https://github.com/ecklein/modeldiff-ml/blob/main/examples/saved_checks_example.py)
 discovers a region, saves it, and evaluates both a failing and a passing candidate on fresh data.
+The
+[`anytime-valid checks example`](https://github.com/ecklein/modeldiff-ml/blob/main/examples/anytime_checks_example.py)
+resumes a saved monitor as labeled batches arrive.
 
 ## Scope and limitations
 
@@ -418,8 +515,9 @@ cannot eliminate them, especially with small data, distribution shift, correlate
 repeated human analysis. A fresh final test set is appropriate before high-stakes deployment.
 
 The project does not make causal claims or provide fairness certification. It also does not include
-multiclass evaluation, distributed execution, monitoring infrastructure, model registries,
-dashboards, or automated remediation.
+multiclass evaluation, distributed execution, hosted monitoring infrastructure, model registries,
+dashboards, or automated remediation. Anytime-valid monitors are local, resumable statistical
+objects rather than a scheduling, storage, or alerting service.
 
 ## Development
 

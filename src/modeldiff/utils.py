@@ -55,6 +55,8 @@ def validate_inputs(
     candidate_predictions: Any,
     task: str,
     metric: str,
+    *,
+    min_samples: int = 4,
 ) -> tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray]:
     """Normalize and validate all inputs for a comparison."""
     if task not in VALID_TASKS:
@@ -68,8 +70,9 @@ def validate_inputs(
     lengths = {len(frame), len(target), len(baseline), len(candidate)}
     if len(lengths) != 1:
         raise ValueError("X, y, and predictions must have equal sample lengths")
-    if len(frame) < 4:
-        raise ValueError("at least four observations are required")
+    if len(frame) < min_samples:
+        noun = "observation" if min_samples == 1 else "observations"
+        raise ValueError(f"at least {min_samples} {noun} are required")
     if task == "binary_classification":
         unique = np.unique(target)
         if not np.all(np.isin(unique, [0.0, 1.0])):
